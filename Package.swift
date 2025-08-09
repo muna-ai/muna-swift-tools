@@ -19,7 +19,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "Embed",
+            name: "MunaEmbedder",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "XcodeProj", package: "XcodeProj")
@@ -34,7 +34,7 @@ let package = Package(
                 ),
                 permissions: [
                     .writeToPackageDirectory(reason: "Allow Muna write the Muna configuration template.")
-                ]
+                ],
             ),
             path: "Plugins/Bootstrap"
         ),
@@ -53,7 +53,7 @@ let package = Package(
                     .writeToPackageDirectory(reason: "Allow Muna to embed predictors into your app.")
                 ]
             ),
-            dependencies: ["Embed"],
+            dependencies: ["MunaEmbedder"],
             path: "Plugins/Embed"
         )
     ]

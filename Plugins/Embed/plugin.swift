@@ -61,7 +61,7 @@ struct EmbedPredictorsPlugin: CommandPlugin, XcodeCommandPlugin {
         try fileManager.createDirectory(at: frameworksPath, withIntermediateDirectories: true)
         // Parse configuration
         let configPath = targetPath.appending(path: "muna.config.swift")
-        var config = try parseConfiguration(path: configPath.path)
+        var config = try parseConfiguration(context:context, path: configPath.path)
         let defaultEnvPath = configPath.deletingLastPathComponent().appending(path: "muna.xcconfig")
         let envPath = config.envPath ?? defaultEnvPath.path
         let env = try parseEnv(at: envPath)
@@ -117,7 +117,7 @@ struct EmbedPredictorsPlugin: CommandPlugin, XcodeCommandPlugin {
 
     private func createPredictions(config: Configuration) async throws -> [Prediction] {
         guard let apiUrl = config.apiUrl, let accessKey = config.accessKey else {
-            throw FunctionError.invalidConfiguration
+            throw MunaError.invalidConfiguration
         }
         var predictions: [Prediction] = []
         try await withThrowingTaskGroup(of: Prediction.self) { taskGroup in
@@ -137,21 +137,21 @@ struct EmbedPredictorsPlugin: CommandPlugin, XcodeCommandPlugin {
                     request.httpBody = jsonData
                     let (data, response) = try await URLSession.shared.data(for: request)
                     guard let httpResponse = response as? HTTPURLResponse else {
-                        throw FunctionError.invalidResponse
+                        throw MunaError.invalidResponse
                     }
                     if httpResponse.statusCode != 200 {
                         let jsonObject = try? JSONSerialization.jsonObject(with: data, options: [])
                         let payload = jsonObject as? [String: Any]
                         let errors = payload?["errors"] as? [[String: Any]]
                         if let message = errors?.first?["message"] as? String {
-                            throw FunctionError.serverError(message)
+                            throw MunaError.serverError(message)
                         } else {
-                            throw FunctionError.invalidStatusCode(httpResponse.statusCode)
+                            throw MunaError.invalidStatusCode(httpResponse.statusCode)
                         }
                     }
                     let decoder = JSONDecoder()
                     guard let prediction = try? decoder.decode(Prediction.self, from: data) else {
-                        throw FunctionError.invalidResponse
+                        throw MunaError.invalidResponse
                     }
                     return prediction
                 }
@@ -162,28 +162,23 @@ struct EmbedPredictorsPlugin: CommandPlugin, XcodeCommandPlugin {
         }
         return predictions
     }
-
-    private func parseConfiguration (path: String) throws -> Configuration {
+    
+    private func parseConfiguration(
+        context: XcodeProjectPlugin.XcodePluginContext,
+        path: String
+    ) throws -> Configuration {
         let prefix = """
         public class Muna {
-
             struct Configuration : Codable {
-                
                 public let tags: [String]
-                
-                public init (tags: [String]) {
-                    self.tags = tags
-                }
+                public init (tags: [String]) { self.tags = tags }
             }
         }
         """
         let suffix = """
-
         import Foundation
-
         let encoder = JSONEncoder()
         encoder.outputFormatting = .prettyPrinted
-
         if let jsonData = try? encoder.encode(config),
            let jsonString = String(data: jsonData, encoding: .utf8) {
             print(jsonString)
@@ -191,46 +186,49 @@ struct EmbedPredictorsPlugin: CommandPlugin, XcodeCommandPlugin {
             fatalError("Failed to encode config to JSON")
         }
         """
-        // Create script
+
+        // Compose script
         var script = try String(contentsOfFile: path, encoding: .utf8)
         script = script.replacingOccurrences(of: "import Muna", with: "")
         script = prefix + script + suffix
-        let tempDirectory = FileManager.default.temporaryDirectory
-        let scriptUrl = tempDirectory.appendingPathComponent("muna.config.swift")
-        try script.write(to: scriptUrl, atomically: true, encoding: .utf8)
-        // Execute
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
-        process.arguments = [
-            "run",
-            scriptUrl.path,
-            "--skip-build",
-            "--disable-build-manifest-caching",
-            "--disable-dependency-cache",
-            "--disable-local-rpath"
+
+        // Use the plugin's writable work dir
+        let fm = FileManager.default
+        let work = URL(fileURLWithPath: context.pluginWorkDirectory.string)
+            .appendingPathComponent("config-eval", isDirectory: true)
+        let moduleCache = work.appendingPathComponent("ModuleCache", isDirectory: true)
+        try? fm.removeItem(at: work)
+        try fm.createDirectory(at: moduleCache, withIntermediateDirectories: true)
+
+        let scriptURL = work.appendingPathComponent("muna.config.swift")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+        // Run the Swift interpreter with cache redirected (no SPM flags here)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
+        proc.arguments = [
+            "-module-cache-path", moduleCache.path,
+            "-Xcc", "-fmodules-cache-path=\(moduleCache.path)",
+            scriptURL.path
         ]
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        try process.run()
-        process.waitUntilExit()
-        // Check
-        if process.terminationStatus != 0 {
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorOutput = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-            throw NSError(
-                domain: "ScriptExecutionError",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: errorOutput]
-            )
+        var env = ProcessInfo.processInfo.environment
+        env["TMPDIR"] = work.path
+        env["HOME"] = work.path
+        env["CLANG_MODULE_CACHE_PATH"] = moduleCache.path
+        env["SWIFT_MODULE_CACHE_PATH"] = moduleCache.path
+        proc.environment = env
+
+        let out = Pipe(), err = Pipe()
+        proc.standardOutput = out; proc.standardError = err
+        try proc.run(); proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "ScriptExecutionError", code: Int(proc.terminationStatus),
+                          userInfo: [NSLocalizedDescriptionKey: msg])
         }
-        // Parse
-        let decoder = JSONDecoder()
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let config = try decoder.decode(Configuration.self, from: outputData)
-        // Return
-        return config
+
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        return try JSONDecoder().decode(Configuration.self, from: data)
     }
 
     private func parseEnv(at path: String) throws -> [String: String] {
@@ -309,19 +307,19 @@ struct EmbedPredictorsPlugin: CommandPlugin, XcodeCommandPlugin {
         }
     }
 
-    private func unzipFile (at zipFilePath: URL, to destinationDirectory: URL) throws {
+    private func unzipFile(at zipFilePath: URL, to destinationDirectory: URL) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
         process.arguments = [zipFilePath.path, "-d", destinationDirectory.path]
         try process.run()
         process.waitUntilExit()
         if process.terminationStatus != 0 {
-            throw FunctionError.downloadError
+            throw MunaError.downloadError
         }
     }
 }
 
-enum FunctionError: Error {
+enum MunaError: Error {
     case networkError(Error)
     case invalidResponse
     case invalidStatusCode(Int)
